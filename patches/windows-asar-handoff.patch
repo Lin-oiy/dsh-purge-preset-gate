@@ -1,0 +1,106 @@
+diff --git a/windows-asar-handoff.orig.js b/C:/Users/DELL/.dsh/profiles/desktop/node_modules/dsh-purge-community/lib/windows-asar-handoff.js
+index 99b5bd5..a5696d7 100644
+--- a/windows-asar-handoff.orig.js
++++ b/C:/Users/DELL/.dsh/profiles/desktop/node_modules/dsh-purge-community/lib/windows-asar-handoff.js
+@@ -3,7 +3,7 @@
+ import os from "node:os";
+ import path from "node:path";
+ import { randomUUID } from "node:crypto";
+-import { spawn } from "node:child_process";
++import { spawn, execFileSync } from "node:child_process";
+ import { hostFs as fs } from "./extract-asar.js";
+ 
+ export const WINDOWS_ASAR_HANDOFF_PS1 = String.raw`param(
+@@ -170,6 +170,38 @@ export function readWindowsAsarHandoff(asar, { strict = false } = {}) {
+   }
+ }
+ 
++// WMI 在某些机器上根本拉不起 PowerShell（helper 还没写 ready 就被回收，broker
++// 只能看到 child_exit_code=unknown）。此时改用计划任务启动同一份 helper，并每分钟
++// 重试：helper 被控制台关闭/系统回收（0xC000013A）时，下一轮会重新拉起并完成换包。
++function scheduleHandoffViaTask({ exe, asar, token, script, statePath, timeoutSeconds = 10800, hours = 3 }) {
++  const taskName = `dsh-purge-handoff-${token.slice(0, 8)}`;
++  const runner = path.join(os.tmpdir(), `dsh-purge-handoff-${token}.run.ps1`);
++  const psq = (value) => "'" + String(value).replaceAll("'", "''") + "'";
++  const body = [
++    "$ErrorActionPreference='Stop'",
++    `& ${psq(script)} -ExePath ${psq(exe)} -AsarPath ${psq(asar)} -StatePath ${psq(statePath)} -Token ${psq(token)} -TimeoutSeconds ${timeoutSeconds}`,
++    // helper 结束（换包完成 / 失效 / 超时）后自删任务，不遗留计划任务
++    `try { $s = Get-Content -LiteralPath ${psq(statePath)} -Raw | ConvertFrom-Json } catch { $s = $null }`,
++    `if (-not $s -or $s.token -ne ${psq(token)} -or $s.phase -in @('complete','already_unsealed','expired','failed')) { schtasks /delete /tn ${psq(taskName)} /f 2>$null | Out-Null }`,
++  ].join("\r\n");
++  fs.writeFileSync(runner, body, "utf8");
++  const powershell = path.join(process.env.SystemRoot || "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
++  // 每分钟重试一次：helper 被控制台关闭/系统回收时（本机复现为 0xC000013A）下一轮自动补上。
++  const register = [
++    "$ErrorActionPreference='Stop'",
++    `$runner = ${psq(runner)}`,
++    `$argument = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + $runner + '"'`,
++    `$action = New-ScheduledTaskAction -Execute ${psq(powershell)} -Argument $argument`,
++    `$trigger = New-ScheduledTaskTrigger -Once -At ((Get-Date).AddYears(1)) -RepetitionInterval (New-TimeSpan -Minutes 1) -RepetitionDuration (New-TimeSpan -Hours ${hours})`,
++    "$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew -StartWhenAvailable",
++    "$principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited",
++    `Register-ScheduledTask -TaskName ${psq(taskName)} -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Force | Out-Null`,
++    `Start-ScheduledTask -TaskName ${psq(taskName)}`,
++  ].join("\r\n");
++  execFileSync(powershell, ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", register], { stdio: "ignore" });
++  return { taskName, script: runner };
++}
++
+ export function scheduleWindowsAsarHandoff({ exe, asar }, io = {}) {
+   // Expand Windows 8.3 aliases before comparing with Get-Process.Path.
+   try { exe = fs.realpathSync(exe); } catch { /* launch errors stay visible below */ }
+@@ -200,23 +232,29 @@ export function scheduleWindowsAsarHandoff({ exe, asar }, io = {}) {
+   // A normal Start-Process child inherits the launcher's Job Object. Use the
+   // local, same-user WMI provider for a job-bound launcher only. Never create
+   // a service/task, request elevation, or start the application.
+-  const helperArgs = quote('-NoProfile -ExecutionPolicy Bypass -EncodedCommand ' + encoded(invoke));
++  // powershell.exe needs one switch per argv entry. Wrapping the whole list in
++  // a single quoted string handed it one literal argument: it echoed the text,
++  // exited 0 and never wrote 'ready', which the broker reported as
++  // "helper exited before acknowledging startup" with no other evidence.
++  const helperArgv = ["-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded(invoke)];
++  const psArray = values => "@(" + values.map(value => quote(value)).join(",") + ")";
++  const helperArgs = psArray(helperArgv);
+   const broker = `$ErrorActionPreference='Stop'
+ $ProgressPreference='SilentlyContinue'
+ Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public static class PurgeJob { [DllImport("kernel32.dll", SetLastError=true)] public static extern bool IsProcessInJob(IntPtr process, IntPtr job, out bool member); }'
+ $inJob=$false
+ if (-not [PurgeJob]::IsProcessInJob([Diagnostics.Process]::GetCurrentProcess().Handle,[IntPtr]::Zero,[ref]$inJob)) { throw "Cannot determine handoff launcher job membership" }
+ $exe=Join-Path $PSHOME 'powershell.exe'
+-$argsText=${helperArgs}
++$helperArgv=${helperArgs}
+ if ($inJob) {
+   $startup=([wmiclass]'Win32_ProcessStartup').CreateInstance()
+   $startup.ShowWindow=0
+-  $result=([wmiclass]'Win32_Process').Create(('"' + $exe + '" ' + $argsText),$env:TEMP,$startup)
++  $result=([wmiclass]'Win32_Process').Create(('"' + $exe + '" ' + ($helperArgv -join ' ')),$env:TEMP,$startup)
+   $childPid=$result.ProcessId
+   Write-Output ("token=" + ${quote(token)} + " WMI.Create return=" + $result.ReturnValue + " child_pid=" + $result.ProcessId)
+   if ($result.ReturnValue -ne 0 -or -not $result.ProcessId) { throw ("Local WMI handoff creation failed: " + $result.ReturnValue) }
+ } else {
+-  $helper = Start-Process -PassThru -FilePath $exe -ArgumentList $argsText -WindowStyle Hidden -RedirectStandardOutput ${quote(launchLog)} -RedirectStandardError ${quote(launchLog + '.error')}
++  $helper = Start-Process -PassThru -FilePath $exe -ArgumentList $helperArgv -WindowStyle Hidden -RedirectStandardOutput ${quote(launchLog)} -RedirectStandardError ${quote(launchLog + '.error')}
+   $childPid=$helper.Id
+   Write-Output ("token=" + ${quote(token)} + " Start-Process child_pid=" + $helper.Id)
+ }
+@@ -278,6 +316,19 @@ throw "Helper pid $childPid did not acknowledge startup within 20 seconds; child
+   child.on("exit", (code, signal) => {
+     const saved = readWindowsAsarHandoff(asar);
+     if (code !== 0 && saved?.token === token && ["starting", "helper_stopped"].includes(saved.phase)) {
++      // 连 ready 都没写出来 = WMI 没能真正启动 PowerShell（本机复现为 exit 5）。
++      // 先重置握手状态，再用计划任务拉起同一份 helper，避免整次换包直接失败。
++      if (saved.phase === "starting") {
++        try {
++          fs.writeFileSync(statePath, JSON.stringify({ token, phase: "starting", updated_at: new Date().toISOString() }), "utf8");
++          const fallback = scheduleHandoffViaTask({ exe, asar, token, script, statePath });
++          console.warn(`[dsh-purge] WMI handoff unusable (broker_exit_code=${code ?? "unknown"}); helper relaunched through scheduled task ${fallback.taskName}`);
++          return;
++        } catch (error) {
++          recordFailure(new Error(`Handoff failed over WMI (broker_exit_code=${code ?? "unknown"}); scheduled-task fallback also failed: ${error.message}`));
++          return;
++        }
++      }
+       recordFailure(new Error(`Handoff broker failed (broker_exit_code=${code ?? "unknown"}, signal=${signal || "none"}); the helper exit code, if observed, is recorded separately in ${statePath}.broker.log`));
+     }
+   });
